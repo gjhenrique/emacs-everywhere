@@ -187,6 +187,14 @@ buffers.")
       (org-ctrl-c-ctrl-c)
     (emacs-everywhere-finish)))
 
+(defun emacs-everywhere-system-type ()
+  "Return the current. Allwed values: darwin (MacOS, Sway and Linux)."
+  (if (eq system-type 'darwin)
+      'darwin
+    (if (getenv "SWAYSOCK")
+        'sway
+      'x11)))
+
 (defun emacs-everywhere-finish (&optional abort)
   "Copy buffer content, close emacs-everywhere window, and maybe paste.
 Must only be called within a emacs-everywhere buffer.
@@ -198,31 +206,39 @@ Never paste content when ABORT is non-nil."
     (unless abort
       (run-hooks 'emacs-everywhere-final-hooks)
       (gui-select-text (buffer-string))
-      (unless (eq system-type 'darwin) ; handle clipboard finicklyness
+      (unless (eq (emacs-everywhere-system-type) 'darwin) ; handle clipboard finicklyness
         (let ((inhibit-message t)
               (require-final-newline nil)
               write-file-functions)
           (write-file buffer-file-name)
           (pp (buffer-string))
-          (call-process "xclip" nil nil nil "-selection" "clipboard" buffer-file-name))))
+          (if (eq (emacs-everywhere-system-type) 'sway)
+              (call-process "wl-copy" buffer-file-name)
+            (call-process "xclip" nil nil nil "-selection" "clipboard" buffer-file-name)))))
     (sleep-for 0.01) ; prevents weird multi-second pause, lets clipboard info propagate
     (let ((window-id (emacs-everywhere-app-id emacs-everywhere-current-app)))
-      (if (eq system-type 'darwin)
-          (call-process "osascript" nil nil nil
-                        "-e" (format "tell application \"%s\" to activate" window-id))
-        (call-process "xdotool" nil nil nil
-                      "windowactivate" "--sync" (number-to-string window-id)))
+          (pcase (emacs-everywhere-system-type)
+            (`darwin
+             (call-process "osascript" nil nil nil
+                           "-e" (format "tell application \"%s\" to activate" window-id)))
+            (`sway (sway-focus-container window-id))
+            (_ (call-process "xdotool" nil nil nil
+                             "windowactivate" "--sync" (number-to-string window-id))))
+
       ;; The frame only has this parameter if this package initialized the temp
       ;; file its displaying. Otherwise, it was created by another program, likely
       ;; a browser with direct EDITOR support, like qutebrowser.
       (when (and (frame-parameter nil 'emacs-everywhere-app)
                  emacs-everywhere-paste-p
                  (not abort))
-        (if (eq system-type 'darwin)
-            (call-process "osascript" nil nil nil
-                          "-e" "tell application \"System Events\" to keystroke \"v\" using command down")
-          (call-process "xdotool" nil nil nil
-                        "key" "--clearmodifiers" "Shift+Insert"))))
+        (pcase (emacs-everywhere-system-type)
+          (`darwin
+           (call-process "osascript" nil nil nil
+                            "-e" "tell application \"System Events\" to keystroke \"v\" using command down"))
+          ;; (`sway (progn (sleep-for 0.1) (call-process "wtype" nil nil nil "-M" "shift" "-P" "Insert" "-m" "shift")))
+          (`sway (call-process "wtype" nil nil nil "-M" "ctrl" "v"))
+          (_ (call-process "xdotool" nil nil nil
+                          "key" "--clearmodifiers" "Shift+Insert")))))
     ;; Clean up after ourselves in case the buffer survives `server-buffer-done'
     ;; (b/c `server-existing-buffer' is non-nil).
     (emacs-everywhere-mode -1)
@@ -241,8 +257,11 @@ Never paste content when ABORT is non-nil."
 
 (defun emacs-everywhere-app-info ()
   "Return information on the active window."
-  (let ((w (pcase system-type
+  (let ((w (pcase (emacs-everywhere-system-type)
              (`darwin (emacs-everywhere-app-info-osx))
+             (`sway (progn
+                      (require 'sway)
+                      (emacs-everywhere-app-info-sway)))
              (_ (emacs-everywhere-app-info-linux)))))
     (setf (emacs-everywhere-app-title w)
           (replace-regexp-in-string
@@ -296,7 +315,22 @@ Never paste content when ABORT is non-nil."
                       (nth 1 window-geometry)
                     (- (nth 1 window-geometry) (nth 3 window-geometry)))
                   (nth 4 window-geometry)
-                  (nth 5 window-geometry))))))
+                  (nth 5 window-geometry))))) )
+
+(defun emacs-everywhere-app-info-sway ()
+  "Return information on the active window, on sway."
+  (let* ((tree (car (sway-list-windows (sway-tree) t t)))
+         (window-properties (gethash "window_properties" tree))
+         (geometry (gethash "rect" tree)))
+    (make-emacs-everywhere-app
+     :id (gethash "id" tree)
+     :class (if window-properties (gethash "class" window-properties) (gethash "app_id" tree))
+     :title (gethash "name" tree)
+     :geometry (list
+                (gethash "x" geometry)
+                (gethash "y" geometry)
+                (gethash "width" geometry)
+                (gethash "height" geometry)))))
 
 (defvar emacs-everywhere--dir (file-name-directory load-file-name))
 
@@ -382,15 +416,23 @@ return windowTitle"))
 
 (defun emacs-everywhere-insert-selection ()
   "Insert the last text selection into the buffer."
-  (if (eq system-type 'darwin)
-      (progn
-        (call-process "osascript" nil nil nil
-                      "-e" "tell application \"System Events\" to keystroke \"c\" using command down")
-        (sleep-for 0.01) ; lets clipboard info propagate
-        (yank))
-    (when-let ((selection (gui-get-selection 'PRIMARY 'UTF8_STRING)))
-      (gui-backend-set-selection 'PRIMARY "")
-      (insert selection)))
+  (pcase (emacs-everywhere-system-type)
+    (`darwin
+     (progn
+       (call-process "osascript" nil nil nil
+                     "-e" "tell application \"System Events\" to keystroke \"c\" using command down")
+       (sleep-for 0.01) ; lets clipboard info propagate
+       (yank)))
+    (`sway
+     (call-process "wtype" nil nil nil "-M" "ctrl" "a")
+     (call-process "wtype" nil nil nil "-M" "ctrl" "c")
+     (sleep-for 0.1)
+     (yank))
+    (_
+     (when-let ((selection (gui-get-selection 'PRIMARY 'UTF8_STRING)))
+       (gui-backend-set-selection 'PRIMARY "")
+       (insert selection))))
+
   (when (and (eq major-mode 'org-mode)
              (emacs-everywhere-markdown-p)
              (executable-find "pandoc"))
